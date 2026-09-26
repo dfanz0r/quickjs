@@ -30869,8 +30869,12 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
     next: ;
     }
 
+    /* pengyz's breakpoint line fixes (one-line functions, return statements) change the
+       pc2line table, and so Error.stack line numbers. Off by default, which keeps upstream
+       2021-03-27 line numbers; a debugging host enables them before compiling. */
+    BOOL breakpoint_lines = ctx->rt->debugger_info.breakpoint_line_info != 0;
     /* init with function start line to ensure generate a valid last line for one-line function */
-    line_num = s->line_num;
+    line_num = breakpoint_lines ? s->line_num : 0;
     for (pos = 0; pos < bc_len; pos = pos_next) {
         op = bc_buf[pos];
         len = opcode_info[op].size;
@@ -31006,7 +31010,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
                 /* remove dead code */
                 int line = -1;
                 dbuf_put(&bc_out, bc_buf + pos, len);
-                if(pos + len < bc_len)
+                if(!breakpoint_lines || pos + len < bc_len)
                     pos = skip_dead_code(s, bc_buf, bc_len, pos + len, &line);
                 else {
                     //NOTE: already arrive the function end, give a valid value to save line num.
@@ -31016,7 +31020,7 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
 
                 pos_next = pos;
                 //NOTE: use <= instead of < to allow we save the last line num
-                if (pos <= bc_len && line >= 0 && line_num != line) {
+                if ((breakpoint_lines ? pos <= bc_len : pos < bc_len) && line >= 0 && line_num != line) {
                     line_num = line;
                     s->line_number_size++;
                     dbuf_putc(&bc_out, OP_line_num);
@@ -54109,6 +54113,10 @@ JSDebuggerLocation js_debugger_current_location(JSContext *ctx, const uint8_t *c
 
 JSDebuggerInfo *js_debugger_info(JSRuntime *rt) {
     return &rt->debugger_info;
+}
+
+void js_debugger_set_breakpoint_line_info(JSRuntime *rt, int enable) {
+    rt->debugger_info.breakpoint_line_info = enable != 0;
 }
 
 uint32_t js_debugger_stack_depth(JSContext *ctx) {

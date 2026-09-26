@@ -53,6 +53,10 @@ typedef struct JSDebuggerInfo {
     int stepping;
     JSDebuggerLocation step_over;
     int step_depth;
+
+    // Nonzero: functions compiled from now on get extra line entries so breakpoints bind on
+    // one-line functions and return statements. Zero (default): upstream line tables.
+    int breakpoint_line_info;
 } JSDebuggerInfo;
 
 void js_debugger_new_context(JSContext *ctx);
@@ -75,6 +79,10 @@ int js_debugger_is_transport_connected(JSRuntime* rt);
 
 JSValue js_debugger_file_breakpoints(JSContext *ctx, const char *path);
 void js_debugger_cooperate(JSContext *ctx);
+
+// Enable breakpoint line information for code compiled after this call. It changes
+// Error.stack line numbers in some cases, so leave it off unless a debugger needs it.
+void js_debugger_set_breakpoint_line_info(JSRuntime *rt, int enable);
 
 // begin internal api functions
 // these functions all require access to quickjs internal structures.
