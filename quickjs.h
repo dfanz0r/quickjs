@@ -842,6 +842,15 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTrac
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
+/* Host clock and time zone for Date, for deterministic runs (replays, tests).
+   now: ms since 1970 UTC. timezone_offset: minutes, as Date.prototype.getTimezoneOffset
+   for the UTC time time_ms (0 is UTC). Either may be NULL for the system's. */
+typedef int64_t JSDateNowFunc(void *opaque);
+typedef int JSTimezoneOffsetFunc(void *opaque, int64_t time_ms);
+void JS_SetDateHooks(JSRuntime *rt, JSDateNowFunc *now,
+                     JSTimezoneOffsetFunc *timezone_offset, void *opaque);
+/* Reseeds this context's Math.random (xorshift64*; a zero seed becomes 1). */
+void JS_SetRandomSeed(JSContext *ctx, uint64_t seed);
 /* if can_block is TRUE, Atomics.wait() can be used */
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 /* set the [IsHTMLDDA] internal slot */

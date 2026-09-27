@@ -280,6 +280,10 @@ struct JSRuntime {
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
+    /* JS_SetDateHooks: a host clock and time zone for Date (NULL: the system's) */
+    JSDateNowFunc *date_now_func;
+    JSTimezoneOffsetFunc *timezone_offset_func;
+    void *date_opaque;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -1793,6 +1797,20 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
 {
     rt->interrupt_handler = cb;
     rt->interrupt_opaque = opaque;
+}
+
+void JS_SetDateHooks(JSRuntime *rt, JSDateNowFunc *now,
+                     JSTimezoneOffsetFunc *timezone_offset, void *opaque)
+{
+    rt->date_now_func = now;
+    rt->timezone_offset_func = timezone_offset;
+    rt->date_opaque = opaque;
+}
+
+void JS_SetRandomSeed(JSContext *ctx, uint64_t seed)
+{
+    /* xorshift64* state must be non zero */
+    ctx->random_state = seed != 0 ? seed : 1;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
@@ -42042,7 +42060,7 @@ static JSValue js___date_clock(JSContext *ctx, JSValueConst this_val,
 
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference
    between UTC time and local time 'd' in minutes */
-static int getTimezoneOffset(int64_t time) {
+static int getTimezoneOffsetSystem(int64_t time) {
 #if defined(_WIN32)
     /* XXX: TODO */
     return 0;
@@ -42077,6 +42095,14 @@ static int getTimezoneOffset(int64_t time) {
 #endif
 }
 
+/* The host's time zone (JS_SetDateHooks) if it set one, else the system's. */
+static int getTimezoneOffset(JSContext *ctx, int64_t time) {
+    JSRuntime *rt = ctx->rt;
+    if (rt->timezone_offset_func)
+        return rt->timezone_offset_func(rt->date_opaque, time);
+    return getTimezoneOffsetSystem(time);
+}
+
 #if 0
 static JSValue js___date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val,
                                            int argc, JSValueConst *argv)
@@ -42088,7 +42114,7 @@ static JSValue js___date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val
     if (isnan(dd))
         return __JS_NewFloat64(ctx, dd);
     else
-        return JS_NewInt32(ctx, getTimezoneOffset((int64_t)dd));
+        return JS_NewInt32(ctx, getTimezoneOffset(ctx, (int64_t)dd));
 }
 
 static JSValue js_get_prototype_from_ctor(JSContext *ctx, JSValueConst ctor,
@@ -48004,7 +48030,7 @@ static __exception int get_date_fields(JSContext *ctx, JSValueConst obj,
     } else {
         d = dval;
         if (is_local) {
-            tz = -getTimezoneOffset(d);
+            tz = -getTimezoneOffset(ctx, d);
             d += tz * 60000;
         }
     }
@@ -48050,7 +48076,7 @@ static double time_clip(double t) {
 
 /* The spec mandates the use of 'double' and it fixes the order
    of the operations */
-static double set_date_fields(double fields[], int is_local) {
+static double set_date_fields(JSContext *ctx, double fields[], int is_local) {
     int64_t y;
     double days, d, h, m1;
     int i, m, md;
@@ -48073,7 +48099,7 @@ static double set_date_fields(double fields[], int is_local) {
         fields[5] * 1000 + fields[6];
     d = days * 86400000 + h;
     if (is_local)
-        d += getTimezoneOffset(d) * 60000;
+        d += getTimezoneOffset(ctx, d) * 60000;
     return time_clip(d);
 }
 
@@ -48125,7 +48151,7 @@ static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
                 goto done;
             fields[first_field + i] = trunc(a);
         }
-        d = set_date_fields(fields, is_local);
+        d = set_date_fields(ctx, fields, is_local);
     }
 done:
     return JS_SetThisTimeValue(ctx, this_val, d);
@@ -48245,9 +48271,12 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
     return JS_NewStringLen(ctx, buf, pos);
 }
 
-/* OS dependent: return the UTC time in ms since 1970. */
-static int64_t date_now(void) {
+/* OS dependent: return the UTC time in ms since 1970. The host's virtual
+   clock (JS_SetDateHooks) replaces the system one when set. */
+static int64_t date_now(JSContext *ctx) {
     struct timeval tv;
+    if (ctx->rt->date_now_func)
+        return ctx->rt->date_now_func(ctx->rt->date_opaque);
     gettimeofday(&tv, NULL);
     return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
 }
@@ -48266,7 +48295,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
     }
     n = argc;
     if (n == 0) {
-        val = date_now();
+        val = date_now(ctx);
     } else if (n == 1) {
         JSValue v, dv;
         if (JS_VALUE_GET_TAG(argv[0]) == JS_TAG_OBJECT) {
@@ -48304,7 +48333,7 @@ static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,
             if (i == 0 && fields[0] >= 0 && fields[0] < 100)
                 fields[0] += 1900;
         }
-        val = (i == n) ? set_date_fields(fields, 1) : NAN;
+        val = (i == n) ? set_date_fields(ctx, fields, 1) : NAN;
     }
 has_val:
 #if 0
@@ -48350,7 +48379,7 @@ static JSValue js_Date_UTC(JSContext *ctx, JSValueConst this_val,
         if (i == 0 && fields[0] >= 0 && fields[0] < 100)
             fields[0] += 1900;
     }
-    return JS_NewFloat64(ctx, set_date_fields(fields, 0));
+    return JS_NewFloat64(ctx, set_date_fields(ctx, fields, 0));
 }
 
 static void string_skip_spaces(JSString *sp, int *pp) {
@@ -48633,7 +48662,7 @@ static JSValue js_Date_parse(JSContext *ctx, JSValueConst this_val,
     }
     for(i = 0; i < 7; i++)
         fields1[i] = fields[i];
-    d = set_date_fields(fields1, is_local) - tz * 60000;
+    d = set_date_fields(ctx, fields1, is_local) - tz * 60000;
     rv = JS_NewFloat64(ctx, d);
 
 done:
@@ -48645,7 +48674,7 @@ static JSValue js_Date_now(JSContext *ctx, JSValueConst this_val,
                            int argc, JSValueConst *argv)
 {
     // now()
-    return JS_NewInt64(ctx, date_now());
+    return JS_NewInt64(ctx, date_now(ctx));
 }
 
 static JSValue js_date_Symbol_toPrimitive(JSContext *ctx, JSValueConst this_val,
@@ -48693,7 +48722,7 @@ static JSValue js_date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val,
     if (isnan(v))
         return JS_NAN;
     else
-        return JS_NewInt64(ctx, getTimezoneOffset((int64_t)trunc(v)));
+        return JS_NewInt64(ctx, getTimezoneOffset(ctx, (int64_t)trunc(v)));
 }
 
 static JSValue js_date_getTime(JSContext *ctx, JSValueConst this_val,
