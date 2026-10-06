@@ -193,16 +193,49 @@ static int js_debugger_get_frame(JSContext *ctx, JSValue args) {
     return frame;
 }
 
-static void js_send_stopped_event(JSDebuggerInfo *info, const char *reason) {
+static void js_send_stopped_event_detail(JSDebuggerInfo *info, const char *reason, const char *detail) {
     JSContext *ctx = info->debugging_ctx;
 
     JSValue event = JS_NewObject(ctx);
     // better thread id?
     JS_SetPropertyStr(ctx, event, "type", JS_NewString(ctx, "StoppedEvent"));
     JS_SetPropertyStr(ctx, event, "reason", JS_NewString(ctx, reason));
+    if (detail)
+        JS_SetPropertyStr(ctx, event, "detail", JS_NewString(ctx, detail));
     int64_t id = (int64_t)info->ctx;
     JS_SetPropertyStr(ctx, event, "thread", JS_NewInt64(ctx, id));
     js_transport_send_event(info, event);
+}
+
+static void js_send_stopped_event(JSDebuggerInfo *info, const char *reason) {
+    js_send_stopped_event_detail(info, reason, NULL);
+}
+
+static void js_debugger_clear_pause_request(JSRuntime *rt, JSDebuggerInfo *info) {
+    if (info->pause_reason)
+        js_free_rt(rt, info->pause_reason);
+    if (info->pause_detail)
+        js_free_rt(rt, info->pause_detail);
+    info->pause_reason = NULL;
+    info->pause_detail = NULL;
+}
+
+static char *js_debugger_strdup(JSRuntime *rt, const char *text) {
+    size_t length = strlen(text);
+    char *copy = js_malloc_rt(rt, length + 1);
+    if (copy)
+        memcpy(copy, text, length + 1);
+    return copy;
+}
+
+void js_debugger_request_pause(JSContext *ctx, const char *reason, const char *detail) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JSDebuggerInfo *info = js_debugger_info(rt);
+    if (!info->transport_close)
+        return;
+    js_debugger_clear_pause_request(rt, info);
+    info->pause_reason = js_debugger_strdup(rt, reason ? reason : "pause");
+    info->pause_detail = detail ? js_debugger_strdup(rt, detail) : NULL;
 }
 
 static void js_free_prop_enum(JSContext *ctx, JSPropertyEnum *tab, uint32_t len)
@@ -537,6 +570,91 @@ void js_debugger_free_context(JSContext *ctx) {
     js_debugger_context_event(ctx, "exited");
 }
 
+// An "OutputEvent": a logpoint's message, or a condition that threw (error).
+static void js_send_output_event(JSDebuggerInfo *info, JSContext *ctx, JSDebuggerLocation location,
+                                 JSValue text, int error) {
+    JSValue event = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, event, "type", JS_NewString(ctx, "OutputEvent"));
+    JS_SetPropertyStr(ctx, event, "output", text);
+    JS_SetPropertyStr(ctx, event, "filename", JS_AtomToString(ctx, location.filename));
+    JS_SetPropertyStr(ctx, event, "line", JS_NewInt32(ctx, location.line));
+    JS_SetPropertyStr(ctx, event, "error", JS_NewBool(ctx, error));
+    js_transport_send_event(info, event);
+}
+
+static int js_is_nonempty_string(JSContext *ctx, JSValueConst value) {
+    if (!JS_IsString(value))
+        return 0;
+    size_t length = 0;
+    const char *text = JS_ToCStringLen(ctx, &length, value);
+    JS_FreeCString(ctx, text);
+    return length > 0;
+}
+
+// The string of an evaluation's result, or of the exception it threw (and `threw` set).
+static JSValue js_debugger_result_text(JSContext *ctx, JSValue result, int *threw) {
+    *threw = JS_IsException(result);
+    JSValue value = *threw ? JS_GetException(ctx) : result;
+    JSValue text = JS_ToString(ctx, value);
+    if (JS_IsException(text)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        text = JS_NewString(ctx, "<a value that cannot be shown>");
+    }
+    JS_FreeValue(ctx, value);
+    return text;
+}
+
+// Whether the breakpoint at `location` stops the script. A breakpoint object may carry
+// "condition" (an expression: it stops only when that is truthy; one that throws stops, saying
+// why) and "log" (an expression whose value is sent as an OutputEvent instead of stopping: a
+// logpoint). Both are evaluated in the current frame, here, with no round trip to the client.
+static int js_debugger_breakpoint_applies(JSDebuggerInfo *info, JSContext *ctx, JSDebuggerLocation location) {
+    const char *filename = JS_AtomToCString(ctx, location.filename);
+    JSValue path_data = js_debugger_file_breakpoints(ctx, filename);
+    JS_FreeCString(ctx, filename);
+    if (JS_IsUndefined(path_data))
+        return 1;
+    JSValue breakpoints = JS_GetPropertyStr(ctx, path_data, "breakpoints");
+    JS_FreeValue(ctx, path_data);
+    JSValue condition = JS_UNDEFINED;
+    JSValue log = JS_UNDEFINED;
+    uint32_t count = js_get_property_as_uint32(ctx, breakpoints, "length");
+    for (uint32_t i = 0; i < count; i++) {
+        JSValue breakpoint = JS_GetPropertyUint32(ctx, breakpoints, i);
+        if ((int)js_get_property_as_uint32(ctx, breakpoint, "line") == location.line) {
+            condition = JS_GetPropertyStr(ctx, breakpoint, "condition");
+            log = JS_GetPropertyStr(ctx, breakpoint, "log");
+            JS_FreeValue(ctx, breakpoint);
+            break;
+        }
+        JS_FreeValue(ctx, breakpoint);
+    }
+    JS_FreeValue(ctx, breakpoints);
+
+    int applies = 1;
+    if (js_is_nonempty_string(ctx, condition)) {
+        JSValue result = js_debugger_evaluate(ctx, 0, condition);
+        if (JS_IsException(result)) {
+            int threw;
+            JSValue text = js_debugger_result_text(ctx, result, &threw);
+            js_send_output_event(info, ctx, location, text, 1);
+        }
+        else {
+            applies = JS_ToBool(ctx, result);
+            JS_FreeValue(ctx, result);
+        }
+    }
+    if (applies && js_is_nonempty_string(ctx, log)) {
+        int threw;
+        JSValue text = js_debugger_result_text(ctx, js_debugger_evaluate(ctx, 0, log), &threw);
+        js_send_output_event(info, ctx, location, text, threw);
+        applies = 0;
+    }
+    JS_FreeValue(ctx, condition);
+    JS_FreeValue(ctx, log);
+    return applies;
+}
+
 // in thread check request/response of pending commands.
 // todo: background thread that reads the socket.
 void js_debugger_check(JSContext* ctx, const uint8_t *cur_pc) {
@@ -583,11 +701,37 @@ void js_debugger_check(JSContext* ctx, const uint8_t *cur_pc) {
     }
 
     int at_breakpoint = js_debugger_check_breakpoint(ctx, info->breakpoints_dirty_counter, cur_pc);
+    if (!at_breakpoint) {
+        info->breakpoint_hit_valid = 0;
+    }
+    else {
+        location = js_debugger_current_location(ctx, cur_pc);
+        depth = js_debugger_stack_depth(ctx);
+        if (info->breakpoint_hit_valid && info->breakpoint_hit_depth == depth
+            && location.filename == info->breakpoint_hit.filename
+            && location.line == info->breakpoint_hit.line) {
+            // Still on the line this breakpoint was decided for.
+            at_breakpoint = 0;
+        }
+        else {
+            info->breakpoint_hit_valid = 1;
+            info->breakpoint_hit = location;
+            info->breakpoint_hit_depth = depth;
+            at_breakpoint = js_debugger_breakpoint_applies(info, ctx, location);
+        }
+    }
     if (at_breakpoint) {
         // reaching a breakpoint resets any existing stepping.
         info->stepping = 0;
         info->is_paused = 1;
         js_send_stopped_event(info, "breakpoint");
+    }
+    else if (info->pause_reason) {
+        // The host asked for a stop here (it outranks stepping, which it ends).
+        info->stepping = 0;
+        info->is_paused = 1;
+        js_send_stopped_event_detail(info, info->pause_reason, info->pause_detail);
+        js_debugger_clear_pause_request(JS_GetRuntime(ctx), info);
     }
     else if (info->stepping) {
         if (info->stepping == JS_DEBUGGER_STEP_CONTINUE) {
@@ -697,6 +841,7 @@ void js_debugger_free(JSRuntime *rt, JSDebuggerInfo *info) {
         info->message_buffer_length = 0;
     }
 
+    js_debugger_clear_pause_request(rt, info);
     JS_FreeValue(info->debugging_ctx, info->breakpoints);
 
     JS_FreeContext(info->debugging_ctx);

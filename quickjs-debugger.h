@@ -57,6 +57,18 @@ typedef struct JSDebuggerInfo {
     // Nonzero: functions compiled from now on get extra line entries so breakpoints bind on
     // one-line functions and return statements. Zero (default): upstream line tables.
     int breakpoint_line_info;
+
+    // The breakpoint hit last decided (whether to pause, log or go on), while execution stays on
+    // its line: a line's breakpoint marks cover all of its instructions, and a condition or a
+    // logpoint must run once per pass over the line, not once per instruction.
+    int breakpoint_hit_valid;
+    JSDebuggerLocation breakpoint_hit;
+    int breakpoint_hit_depth;
+
+    // A pause the host asked for (js_debugger_request_pause): taken at the next instruction,
+    // reported with this reason and detail.
+    char *pause_reason;
+    char *pause_detail;
 } JSDebuggerInfo;
 
 void js_debugger_new_context(JSContext *ctx);
@@ -79,6 +91,12 @@ int js_debugger_is_transport_connected(JSRuntime* rt);
 
 JSValue js_debugger_file_breakpoints(JSContext *ctx, const char *path);
 void js_debugger_cooperate(JSContext *ctx);
+
+// Stops at the next instruction the script runs, as if paused, reporting `reason` (and
+// `detail`, may be NULL) in the StoppedEvent. From the thread running the script (inside a host
+// function, say: the stop comes right after it returns). A later request before it is taken
+// replaces it.
+void js_debugger_request_pause(JSContext *ctx, const char *reason, const char *detail);
 
 // Enable breakpoint line information for code compiled after this call. It changes
 // Error.stack line numbers in some cases, so leave it off unless a debugger needs it.
